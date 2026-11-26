@@ -20,7 +20,7 @@ local json = ug_require(MOD .. "::/mcp_bridge/mcp_bridge_json.lua")
 local collect = ug_require(MOD .. "::/mcp_bridge/mcp_bridge_collect.lua")
 local extra = ug_require(MOD .. "::/mcp_bridge/mcp_bridge_extra.lua")
 
-local VERSION = 5
+local VERSION = 6
 local USERDATA_DIRS = { "mod_presets", "recordings", "keyframes" }
 local PREFIX = "mcp_bridge__"
 local PART_CHARS = 200000
@@ -28,7 +28,7 @@ local POLL_SEC = 0.5 -- while requests are coming in
 local POLL_IDLE_SEC = 3 -- otherwise: each check of the request file costs a few ms, so it is rare when nobody asks
 local ACTIVE_SEC = 120 -- how long after a request the fast checks continue
 -- request kinds, in the order queued requests are served
-local KINDS = { "snapshot", "models", "industries", "stations", "finances", "vehicles" }
+local KINDS = { "snapshot", "models", "industries", "stations", "finances", "vehicles", "warehouses" }
 local KNOWN = {}
 for _, k in ipairs(KINDS) do KNOWN[k] = true end
 

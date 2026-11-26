@@ -77,6 +77,17 @@ local function num(v)
 end
 
 ---------------------------------------------------------------------------------------------------------------------
+-- cargo quality as the game reports it (UtilCargo.CargoQualityData): countBad = units no longer in time, i.e. past
+-- their delivery time; averageQuality; isVeryBad. nil when nothing is there.
+local function quality(q)
+	if q == nil then return nil end
+	local total = num(get(q, "countTotal")) or 0
+	if total <= 0 then return nil end
+	local avg = num(get(q, "averageQuality"))
+	return { count = total, pastDue = num(get(q, "countBad")) or 0,
+		quality = avg and math.floor(avg * 1000 + 0.5) / 1000 or nil, veryBad = get(q, "isVeryBad") and true or nil }
+end
+
 -- enums and names
 
 local reverse = {}
@@ -464,6 +475,14 @@ function M.line(id, ctx)
 		end
 		L.logsPerYear = logs
 	end
+	-- cargo and passengers on the line that are past their delivery time
+	local sq = try("getSummarizedCargoQualityDataForLine", function()
+		return api.engine.util.cargo.getSummarizedCargoQualityDataForLine(id)
+	end)
+	if sq ~= nil then
+		L.cargoQuality = quality(get(sq, "cargo"))
+		L.passengerQuality = quality(get(sq, "passengers"))
+	end
 	L.problem = ctx.problems and ctx.problems[id] or nil
 	return L
 end
@@ -638,5 +657,6 @@ end
 M.size, M.at, M.toArray, M.try = size, at, toArray, try
 M.get, M.eachPair, M.num, M.note, M.enumName = get, eachPair, num, note, enumName
 M.cargoName, M.nameOf, M.bboxCentre, M.stateName = cargoName, nameOf, bboxCentre, stateName
+M.quality = quality
 
 return M
