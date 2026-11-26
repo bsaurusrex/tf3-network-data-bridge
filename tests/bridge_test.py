@@ -64,7 +64,7 @@ local function vec(t) return setmetatable({}, { __index = { size = function() re
 
 local CT = { NAME=1, LINE=2, TRANSPORT_VEHICLE=3, GAME_TIME=4, GAME_SPEED=5, LOG_BOOK=6, STATION_GROUP=7, TOWN=8,
   BOUNDING_VOLUME=9, TOWN_BUILDING=10, INDUSTRY=11, STOCK_LIST=12, CONSTRUCTION=13, STATION=14, VEHICLE_DEPOT=15,
-  ACCOUNT=16, PLAYER_OWNED=17 }
+  ACCOUNT=16, PLAYER_OWNED=17, WAREHOUSE=18 }
 local comps = {
   [1] = { [CT.GAME_TIME] = { gameTime = 5000000 }, [CT.GAME_SPEED] = { speedup = 1, millisPerDay = 2000 } },
   [100] = { [CT.NAME] = { name = "Line A" }, [CT.LINE] = { stops = vec({ { stationGroup = 500 }, { stationGroup = 501 } }),
@@ -92,6 +92,15 @@ local comps = {
   [601] = { [CT.STATION] = { terminals = { { passengersLoad = true, cargoLoad = true } }, catchmentAreas = { { position = { x = 21000, y = 2050 } } } } },
   [800] = { [CT.VEHICLE_DEPOT] = { carrier = 0, transportModes = { [3] = true }, catchmentArea = { position = { x = 1100, y = 2100 } } } },
   [42] = { [CT.ACCOUNT] = { balance = 9999999, loan = 250000 } },
+  -- a warehouse holding C5: a lot is delivered, little leaves again, and some had to be thrown away
+  [750] = { [CT.NAME] = { name = "Planks Warehouse" }, [CT.WAREHOUSE] = { construction = 760, stockList = 770 } },
+  [760] = { [CT.CONSTRUCTION] = { fileName = "warehouse/warehouse_small.con" },
+            [CT.BOUNDING_VOLUME] = { bbox = { min = { x = 1190, y = 2090 }, max = { x = 1210, y = 2110 } } } },
+  [770] = { [CT.STOCK_LIST] = { stocks = vec({ { capacity = 100 }, { capacity = 100 }, { capacity = 50 }, { capacity = 100 } }),
+            thrownAwayCargo = 0 }, [CT.LOG_BOOK] = { name2log = { itemsUnloaded = {}, itemsLoaded = {}, itemsLoaded1 = {} } } },
+  -- a warehouse whose construction (not the warehouse itself) is owned by someone else: not ours
+  [751] = { [CT.NAME] = { name = "Rival Warehouse" }, [CT.WAREHOUSE] = { construction = 761, stockList = 771 } },
+  [761] = { [CT.CONSTRUCTION] = { fileName = "warehouse/warehouse_small.con" }, [CT.PLAYER_OWNED] = { player = 99 } },
 }
 local function mkVeh(id, name, model, bought)
   comps[id] = { [CT.NAME] = { name = name }, [CT.TRANSPORT_VEHICLE] = {
@@ -106,6 +115,7 @@ local STOCK = { -- stock list -> { inputs, outputs, per-cargo numbers }
   [720] = { {}, { 5 }, { produced = { [5] = 400 }, maxProd = { [5] = 800 }, shipped = { [5] = 300 } } },
   [721] = { { 5, 6 }, { 7 }, { delivered = { [5] = 100, [6] = 0 }, consumed = { [5] = 100 }, maxCons = { [5] = 400, [6] = 400 },
             produced = { [7] = 50 }, maxProd = { [7] = 400 }, shipped = { [7] = 0 } } },
+  [770] = { {}, { 5 }, { delivered = { [5] = 500 }, shipped = { [5] = 100 } } },
 }
 local function stockVal(key) return function(sl, c) return (STOCK[sl][3][key] or {})[c] or 0 end end
 
@@ -125,7 +135,8 @@ api = {
   type = {
     ComponentType = CT,
     ChartConfig = { new = function() return { interval = 0, count = 0 } end },
-    enum = { Carrier = { ROAD = 0, RAIL = 1 }, TransportVehicleState = { IN_DEPOT = 0, EN_ROUTE = 1 }, TransportMode = { BUS = 3 } },
+    enum = { Carrier = { ROAD = 0, RAIL = 1 }, TransportVehicleState = { IN_DEPOT = 0, EN_ROUTE = 1 }, TransportMode = { BUS = 3 },
+             StockListType = { InputStock = 0, OutputStock = 1, StorageStock = 2 } },
     LineProblem = { NOTHING = 0, NO_PATH = 4 },
     Date = { now = function() return { year = 2026, month = 10, day = 11 } end }, -- real clock, like the game
     VehiclePart = { new = function() return {} end },
@@ -150,6 +161,7 @@ api = {
       if c == CT.INDUSTRY then return { 701, 700 } end
       if c == CT.STATION then return { 600, 601 } end
       if c == CT.VEHICLE_DEPOT then return { 800 } end
+      if c == CT.WAREHOUSE then return { 751, 750 } end
       return {}
     end,
     util = {
@@ -164,12 +176,39 @@ api = {
                 getCargoTypeDeliveredPerYear = stockVal("delivered"), getCargoConsumedPerYear = stockVal("consumed"),
                 getCargoMaxConsumptionPerYear = stockVal("maxCons"), getCargoProducedPerYear = stockVal("produced"),
                 getCargoMaxProductionPerYear = stockVal("maxProd"), getCargoTypeShippedPerYear = stockVal("shipped"),
-                getProductionRating = function() return 0.5 end },
+                getProductionRating = function() return 0.5 end,
+                getCargoDeliveredPerYear = function(sl) return sl == 770 and 500 or 0 end,
+                getCargoShippedPerYear = function(sl) return sl == 770 and 100 or 0 end,
+                getStockListsWithThrownAwayCargo = function() return { [770] = 25 } end,
+                getAdjustedDeliveryTime = function(c) return 1440 end,
+                getCargoLogValueDiffPerYear = function(sl, name, c)
+                  if sl ~= 770 then return 0 end
+                  local logs = { [5] = { itemsUnloaded = 450, itemsLoaded = 100, itemsLoaded1 = 50 }, [7] = { itemsLoaded1 = 4 } }
+                  return (logs[c] or {})[name] or 0
+                end,
+                getStockGroupsByTypeAndCargoTypes = function(sl, byType, showEmpty, producedOnly)
+                  if sl ~= 770 then return {} end
+                  -- { stock list type, stock ids (0-based), cargo types, amount held now }
+                  return { { 2, { 0, 1 }, { 5 }, 120 }, { 2, { 2 }, { 6 }, 0 }, { 2, { 3 }, { 5, 6, 7 }, 30 } }
+                end },
       industry = { getIndustryProductivityInfo = function(e) return { producing = e == 700 } end,
                    getClosingIndustries = function() return { { 701, "industry/steel_mill.con" } } end },
       station = { calculateStationUsage = function(st) return { totalUsed = 30, overflow = 0, poolCapacity = 50, terminalCapacity = 50 } end,
                   isStationOfType = function(st, cargo) return false end },
-      cargo = { getCargoQualityDataAtStationGroup = function(g, c) return { countTotal = (g == 500 and c == 37) and 42 or 0, isVeryBad = g == 500 } end },
+      cargo = { getCargoQualityDataAtStationGroup = function(g, c)
+                  if g == 500 and c == 37 then return { countTotal = 42, countBad = 7, averageQuality = 0.25, isVeryBad = true } end
+                  return { countTotal = 0, isVeryBad = g == 500 } end,
+                getCargoQualityDataForStockList = function(sl, c)
+                  if sl == 720 and c == 5 then return { countTotal = 60, countBad = 12, averageQuality = 0.5, isVeryBad = false } end
+                  if sl == 770 and c == 5 then return { countTotal = 140, countBad = 30, averageQuality = 0.6, isVeryBad = false } end
+                  if sl == 770 and c == 7 then return { countTotal = 10, countBad = 10, averageQuality = 0.1, isVeryBad = true } end
+                  return { countTotal = 0, countBad = 0, isVeryBad = false } end,
+                getSummarizedCargoQualityDataForStockList = function(sl)
+                  if sl == 770 then return { cargo = { countTotal = 150, countBad = 40, averageQuality = 0.57 }, passengers = { countTotal = 0 } } end
+                  return { cargo = { countTotal = 0 }, passengers = { countTotal = 0 } } end,
+                getSummarizedCargoQualityDataForLine = function(l)
+                  if l == 100 then return { cargo = { countTotal = 0 }, passengers = { countTotal = 30, countBad = 3, averageQuality = 0.8 } } end
+                  return { cargo = { countTotal = 20, countBad = 5, averageQuality = 0.4 }, passengers = { countTotal = 0 } } end },
       vehicle = { getRunningCost = function() return 3000 end, getDepreciatedValue = function() return 20000 end,
                   getPartPrice = function(p) return p.part.modelId * 1000 end,
                   getPosition = function(v) return { x = v * 10, y = 2000, z = 0 } end, getSpeed = function() return 12.5 end },
@@ -180,6 +219,10 @@ api = {
                getTownReachability = function() return { commercialPublic = 5, commercialPrivate = 9, industrialPublic = 1, industrialPrivate = 4 } end },
     },
     system = {
+      simEntityAtStockSystem = { getStockCountForCargoType = function(holder, sid, c)
+        if holder == 770 and sid == 3 then return ({ [5] = 20, [7] = 10 })[c] or 0 end
+        return 0
+      end },
       lineSystem = { getLinesForPlayer = function() return vec({ 100, 101 }) end,
                      getLinesForStationGroup = function(g) return { 100 } end,
                      getLineStops = function(g) return { { 100, g == 500 and 0 or 1 } } end,
@@ -192,7 +235,7 @@ api = {
       stationSystem = { getStation2TownMap = function() return { [600] = 900, [601] = 901 } end,
                         getTown = function(st) return st == 600 and 900 or 901 end },
       stationGroupSystem = { getStationGroup = function(st) return st == 600 and 500 or 501 end },
-      streetConnectorSystem = { getConstructionClosestTown = function(con) return con == 710 and 900 or 901 end },
+      streetConnectorSystem = { getConstructionClosestTown = function(con) return (con == 710 or con == 760) and 900 or 901 end },
       townBuildingSystem = { getTown2personCapacitiesMap = function() return { [900] = { 1000, 100, 20 }, [901] = vec({ 300, 30, 0 }) } end,
         getTown2BuildingMap = function() return { [900] = vec({ 1000, 1001 }), [901] = { 1002 } } end,
         getCargoSupplyAndLimit = function(t) if t == 900 then return { [4] = { 5, 10, 0 } } end return {} end },
@@ -244,6 +287,9 @@ st = srv.tool_list_stations({})
 dep = srv.tool_list_depots({})
 fin = srv.tool_finances({})
 live = srv.tool_live_vehicles({"line": "line a"})
+wh = srv.tool_list_warehouses({})
+stale = srv.tool_stale_cargo({})
+w0 = wh["warehouses"][0]
 summary = srv.tool_live_vehicles({})
 towns_cargo = srv.tool_list_towns({"name_contains": "spring"})
 stop.set(); loop.join(2)
@@ -286,7 +332,7 @@ checks += [
                     and srv.tool_route_ideas({})["totalMatching"] == 0),
     ("town cargo needs/supply", [(t.get("cargoNeeds"), t.get("cargoSupply")) for t in towns_cargo["towns"]]
                                 == [({"residential": ["C4"]}, {"C4": {"supply": 5, "limit": 10}})]),
-    ("mod version", srv.mod_version() == 5),
+    ("mod version", srv.mod_version() == 6),
     ("option logEach", sum(1 for x in g.LOG.values() if "answered" in x) >= 2),
     ("no diagnostics", m["diagnostics"] == {} or m["diagnostics"] == []),
 ]
@@ -302,6 +348,53 @@ extra_checks = [
                                                "industryDemandPerYear": 400, "deliveredToIndustriesPerYear": 100, "consumers": 1}),
     ("industry filter", srv.tool_list_industries({"status": "unshipped"})["totalMatching"] == 1
                         and srv.tool_list_industries({"cargo": "c6"})["totalMatching"] == 1),
+    ("warehouses", wh["totalMatching"] == 1 and w0["name"] == "Planks Warehouse"
+                   and w0["type"] == "warehouse_small" and w0["town"] == "Springfield"
+                   and w0["position"] == {"x": 1200, "y": 2100}
+                   and (w0["waitingTotal"], w0["capacityTotal"], w0["usagePct"]) == (150, 350, 42.9)
+                   and (w0["deliveredPerYear"], w0["shippedPerYear"], w0["thrownAwayCargo"]) == (500, 100, 25)
+                   and w0["holding"] == {"C5": 140, "C7": 10} and (w0["pastDue"], w0["quality"]) == (40, 0.57)
+                   and w0["logNames"] == ["itemsLoaded", "itemsLoaded1", "itemsUnloaded"]
+                   and (w0["inPerYear"], w0["outPerYear"]) == (450, 154)),
+    ("warehouse slots", w0["stocks"] == [
+        {"stockType": "StorageStock", "cargos": ["C5"], "waiting": 120, "capacity": 200, "slots": 2},
+        {"stockType": "StorageStock", "cargos": ["C6"], "waiting": 0, "capacity": 50, "slots": 1},
+        {"stockType": "StorageStock", "cargos": ["C5", "C7"], "waiting": 30, "capacity": 100, "slots": 1,
+         "mixed": True, "accepts": 3, "held": {"C5": 20, "C7": 10}}]),
+    ("warehouse flows", w0["flows"] == [
+        {"cargo": "C5", "deliveredPerYear": 500, "shippedPerYear": 100,
+         "logsPerYear": {"itemsUnloaded": 450, "itemsLoaded": 100, "itemsLoaded1": 50},
+         "pastDue": 30, "quality": 0.6, "deliveryTimeSec": 1440, "inPerYear": 450, "outPerYear": 150},
+        {"cargo": "C7", "deliveredPerYear": 0, "shippedPerYear": 0, "logsPerYear": {"itemsLoaded1": 4},
+         "pastDue": 10, "quality": 0.1, "veryBad": True, "deliveryTimeSec": 1440, "inPerYear": 0, "outPerYear": 4}]
+                        and wh["byCargo"] == {
+        "C5": {"waiting": 140, "pastDue": 30, "inPerYear": 450, "outPerYear": 150, "warehouses": 1},
+        "C7": {"waiting": 10, "pastDue": 10, "inPerYear": 0, "outPerYear": 4, "warehouses": 1}}),
+    ("warehouse flags", set(w0["flags"]) == {"past_due", "overflowing"} and "stuckCargo" not in w0
+                        # C7 is not stuck: the game's shipped counter says 0, but itemsLoaded1 shows 4 leaving
+                        and srv.warehouse_flags({"waitingTotal": 5, "holding": {"X": 5},
+                                                 "flows": [{"cargo": "X", "shippedPerYear": 0}],
+                                                 "stocks": [{"capacity": 5, "waiting": 5}]}) == ["full", "nothing_leaves", "stuck_cargo"]
+                        and srv.tool_list_warehouses({"status": "stuck_cargo"})["totalMatching"] == 0
+                        and srv.tool_list_warehouses({"status": "past_due"})["totalMatching"] == 1
+                        and srv.tool_list_warehouses({"status": "unused"})["totalMatching"] == 0
+                        and srv.tool_list_warehouses({"cargo": "C7"})["totalMatching"] == 1
+                        and srv.tool_list_warehouses({"cargo": "C6"})["totalMatching"] == 0),
+    ("station past due", st["stations"][0]["pastDue"] == {"PASSENGERS": {"count": 42, "pastDue": 7, "quality": 0.25, "veryBad": True}}
+                         and "pastDue" not in st["stations"][1]),
+    ("industry output past due", [(o.get("waiting"), o.get("pastDue"), o.get("quality")) for o in by["Coal Mine"]["outputs"]] == [(60, 12, 0.5)]
+                                 and "pastDue" not in by["Steel Mill"]["outputs"][0]),
+    ("line past due", sorted((r.get("cargoPastDue") or 0) for r in srv.tool_list_lines({})["lines"]) == [0, 5]
+                      and srv.tool_get_line({"line": "line a"}).get("passengerQuality") == {"count": 30, "pastDue": 3, "quality": 0.8}),
+    ("stale cargo", (stale["totalPastDue"], stale["places"]) == (57, 4)
+                    and [(r["where"], r.get("cargo") if r["where"] != "line" else None, r["pastDue"]) for r in stale["rows"]]
+                        == [("warehouse", "C5", 30), ("industry", "C5", 12), ("warehouse", "C7", 10), ("line", None, 5)]
+                    and stale["byCargo"] == {"C5": {"pastDue": 42, "places": 2}, "C7": {"pastDue": 10, "places": 1}}
+                    and stale["pastDueOnLines"] == 5 and stale["deliveryTimes"]["C5"]["seconds"] == 1440
+                    and "warning" not in stale),
+    ("stale cargo filters", srv.tool_stale_cargo({"cargo": "C7"})["places"] == 1
+                            and srv.tool_stale_cargo({"where": ["industries"]})["places"] == 1
+                            and srv.tool_stale_cargo({"min_past_due": 11})["places"] == 2),
     ("stations", [(x["name"], x.get("waitingTotal"), x["terminals"], x["town"], x["usagePct"]) for x in st["stations"]]
                  == [("Central", 42, 2, "Springfield", 30.0), ('Harbour "Pier" \\ 1\nb', 0, 1, "Zürich", 30.0)]
                  and st["stations"][0]["longWaits"] == ["PASSENGERS"] and st["stations"][0]["lines"] == ["Line A"]

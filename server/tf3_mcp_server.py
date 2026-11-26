@@ -21,7 +21,7 @@ import sys
 import time
 
 SERVER_NAME = "tf3-mcp-bridge"
-SERVER_VERSION = "1.2.1"
+SERVER_VERSION = "1.3.0"
 APP_ID = "3493540"
 EXCHANGE_DIRS = ("recordings", "keyframes", "mod_presets")
 PREFIX = "mcp_bridge__"
@@ -29,7 +29,8 @@ REQUEST_TIMEOUT_SEC = float(os.environ.get("TF3_MCP_TIMEOUT", "20"))
 SNAPSHOT_REUSE_SEC = 3  # several tool calls in one answer share one snapshot
 MODELS_REUSE_SEC = 600
 # newer request kinds: (seconds an answer is reused, first mod bridgeVersion that answers it)
-KINDS = {"industries": (60, 5), "stations": (10, 5), "finances": (10, 5), "vehicles": (2, 5)}
+KINDS = {"industries": (60, 5), "stations": (10, 5), "finances": (10, 5), "vehicles": (2, 5),
+         "warehouses": (10, 6)}
 
 # ----------------------------------------------------------------------------------------------------------------
 # locating the exchange folder
@@ -509,6 +510,7 @@ def line_row(l):
         "runningCostsPerYear": l.get("runningCostsPerYear"),
         "intervalSec": interval_sec(l),
         "problem": l.get("problem"),
+        "cargoPastDue": (l.get("cargoQuality") or {}).get("pastDue"),
     }
 
 
@@ -926,7 +928,8 @@ def tool_list_stations(args):
         "totalMatching": len(rows),
         "stations": rows[:limit],
         "notes": "One row per station group (stations that share a name). waiting = passengers or cargo waiting now, "
-                 "per cargo; longWaits = cargo the game marks as waiting very long. usage = people in the station vs "
+                 "per cargo; longWaits = cargo the game marks as waiting very long; pastDue = per cargo: count, pastDue (units "
+                 "past their delivery time) and quality 0-1. usage = people in the station vs "
                  "its waiting capacity (overflow = over capacity).",
     }
     out.update(freshness(warning, age))
@@ -970,6 +973,236 @@ def tool_list_depots(args):
            "notes": "Your depots with carrier (from the depot's name when the game does not report it), position "
                     "(world metres), vehicles parked inside and the nearest town. Maintenance buildings are marked."}
     out.update(freshness(warning, age))
+    return out
+
+
+def flow_in_out(f):
+    """Incoming and outgoing per year for one cargo, from the warehouse's logbook: itemsUnloaded* (unloaded from
+    vehicles into the warehouse) and itemsLoaded* (loaded onto vehicles), summed over the numbered variants. The
+    plain itemsLoaded equals the game's shipped counter; the numbered ones are further channels it leaves out."""
+    logs = f.get("logsPerYear") or {}
+    if not logs:
+        return None, f.get("shippedPerYear")
+    return (sum(v for k, v in logs.items() if k.startswith("itemsUnloaded")),
+            sum(v for k, v in logs.items() if k.startswith("itemsLoaded")))
+
+
+def warehouse_stuck_cargo(w):
+    """Cargo the warehouse holds now of which none left in the last 12 months."""
+    out = {f.get("cargo"): flow_in_out(f)[1] or 0 for f in w.get("flows") or []}
+    return sorted(c for c, n in (w.get("holding") or {}).items() if n and not out.get(c))
+
+
+def warehouse_flags(w):
+    """What is wrong with this warehouse, from what the game reports."""
+    flags = []
+    out = sum(flow_in_out(f)[1] or 0 for f in w.get("flows") or []) or (w.get("shippedPerYear") or 0)
+    waiting = w.get("waitingTotal") or 0
+    if (w.get("pastDue") or 0) > 0:
+        flags.append("past_due")
+    if (w.get("thrownAwayCargo") or 0) > 0:
+        flags.append("overflowing")
+    if any((g.get("capacity") or 0) > 0 and (g.get("waiting") or 0) >= g["capacity"] for g in w.get("stocks") or []):
+        flags.append("full")
+    if waiting > 0 and out == 0:
+        flags.append("nothing_leaves")
+    if warehouse_stuck_cargo(w):
+        flags.append("stuck_cargo")
+    if waiting == 0 and out == 0 and not w.get("flows"):
+        flags.append("unused")
+    return flags
+
+
+WAREHOUSE_STATUS = ("all", "past_due", "overflowing", "full", "nothing_leaves", "stuck_cargo", "unused")
+WAREHOUSE_SORT = ("waitingTotal", "pastDue", "inPerYear", "outPerYear", "name")
+
+
+def tool_list_warehouses(args):
+    data, warning, age = load_kind("warehouses")
+    items = data.get("warehouses") or []
+    towns = town_positions()
+    cargo = (args.get("cargo") or "").upper()
+    town = (args.get("town") or "").lower()
+    name_contains = (args.get("name_contains") or "").lower()
+    status = args.get("status") or "all"
+    if status not in WAREHOUSE_STATUS:
+        raise ValueError(f"status must be one of {list(WAREHOUSE_STATUS)}")
+    sort_by = args.get("sort_by") or "waitingTotal"
+    if sort_by not in WAREHOUSE_SORT:
+        raise ValueError(f"sort_by must be one of {list(WAREHOUSE_SORT)}")
+    by_cargo = {}
+    rows = []
+    for w in items:
+        flows = []
+        for f in w.get("flows") or []:
+            fin, fout = flow_in_out(f)
+            flows.append(compact(dict(f, inPerYear=fin, outPerYear=fout)))
+            c = by_cargo.setdefault(f["cargo"], {"waiting": 0, "pastDue": 0, "inPerYear": 0, "outPerYear": 0,
+                                                 "warehouses": 0})
+            c["inPerYear"] += fin or 0
+            c["outPerYear"] += fout or 0
+            c["pastDue"] += f.get("pastDue") or 0
+            c["warehouses"] += 1
+        for name, n in (w.get("holding") or {}).items():
+            c = by_cargo.setdefault(name, {"waiting": 0, "pastDue": 0, "inPerYear": 0, "outPerYear": 0,
+                                           "warehouses": 0})
+            c["waiting"] += n or 0
+        flags = warehouse_flags(w)
+        if status != "all" and status not in flags:
+            continue
+        if town and town not in (w.get("town") or "").lower():
+            continue
+        if name_contains and name_contains not in (w.get("name") or "").lower():
+            continue
+        moved = {f.get("cargo") for f in w.get("flows") or []} | set(w.get("holding") or {})
+        if cargo and not any(cargo in (c or "") for c in moved):
+            continue
+        row = dict(w)
+        row["flags"] = flags
+        if flows:
+            row["flows"] = flows
+            row["inPerYear"] = sum(f.get("inPerYear") or 0 for f in flows)
+            row["outPerYear"] = sum(f.get("outPerYear") or 0 for f in flows)
+        stuck = warehouse_stuck_cargo(w)
+        if stuck:
+            row["stuckCargo"] = stuck
+        row["capacityTotal"] = sum((g.get("capacity") or 0) for g in w.get("stocks") or []) or None
+        if row["capacityTotal"]:
+            row["usagePct"] = pct(row.get("waitingTotal") or 0, row["capacityTotal"])
+        row["nearestTown"] = nearest_town(w.get("position"), towns)
+        rows.append(compact(row))
+    if sort_by == "name":
+        rows.sort(key=lambda r: (r.get("name") or "").lower())
+    else:
+        rows.sort(key=lambda r: -(r.get(sort_by) or 0))
+    limit = max(1, min(int(args.get("limit") or 50), 1000))
+    out = {"totalMatching": len(rows), "warehouses": rows[:limit],
+           "notes": "Your warehouses. stocks = one row per stock slot group: waiting now vs capacity; a mixed slot "
+                    "(accepts = how many cargo types it takes, e.g. All Cargo Types) lists what it actually holds in "
+                    "held. holding = amount per cargo over all slots (a cargo's room is its own slot plus any mixed "
+                    "slot). pastDue = units past their delivery time, quality = 0-1 (the game's cargo quality). "
+                    "flows = per cargo over 12 months: shippedPerYear (left the warehouse), logsPerYear (the "
+                    "warehouse's own logbook), inPerYear / outPerYear (from the logbook: itemsUnloaded* in, itemsLoaded* "
+                    "out, summed over the numbered channels; shippedPerYear only counts the plain itemsLoaded), "
+                    "deliveryTimeSec (the cargo type's delivery time). deliveredPerYear is the game's counter and "
+                    "reads 0 in current builds. flags: past_due, overflowing (cargo thrown away), full (a stock slot "
+                    "is at capacity), nothing_leaves (holds cargo, nothing left in 12 months), stuck_cargo (holds a "
+                    "cargo of which none left in 12 months), unused."}
+    if by_cargo:
+        out["byCargo"] = by_cargo
+    out.update(freshness(warning, age))
+    return out
+
+
+STALE_WHERE = ("warehouses", "stations", "industries", "lines")
+
+
+def tool_stale_cargo(args):
+    """Every place holding cargo past its delivery time: warehouses, stations, industries' output stocks, lines."""
+    cargo = (args.get("cargo") or "").upper()
+    town = (args.get("town") or "").lower()
+    where = args.get("where") or list(STALE_WHERE)
+    if isinstance(where, str):
+        where = [where]
+    bad = [w for w in where if w not in STALE_WHERE]
+    if bad:
+        raise ValueError(f"where must be among {list(STALE_WHERE)}")
+    min_past_due = max(1, int(args.get("min_past_due") or 1))
+    rows, by_cargo, problems, delivery = [], {}, {}, {}
+    on_lines = 0
+    oldest_age = 0
+
+    def wanted(cargo_names, towns_of):
+        if cargo and not any(cargo in (c or "") for c in cargo_names):
+            return False
+        if town and not any(town in (t or "").lower() for t in towns_of):
+            return False
+        return True
+
+    def add(kind, item, cargo_name, q, extra=None):
+        n = (q or {}).get("pastDue") or 0
+        if n < min_past_due or cargo_name == "PASSENGERS":
+            return
+        if not wanted([cargo_name], [item.get("town")]):
+            return
+        row = {"where": kind, "id": item.get("id"), "name": item.get("name"), "town": item.get("town"),
+               "cargo": cargo_name, "pastDue": n, "count": q.get("count"), "quality": q.get("quality"),
+               "veryBad": q.get("veryBad")}
+        if extra:
+            row.update(extra)
+        rows.append(compact(row))
+        c = by_cargo.setdefault(cargo_name, {"pastDue": 0, "places": 0})
+        c["pastDue"] += n
+        c["places"] += 1
+
+    def load(kind):
+        nonlocal oldest_age
+        try:
+            data, warning, age = load_kind(kind) if kind != "lines" else load_snapshot()
+            oldest_age = max(oldest_age, age or 0)
+            if warning:
+                problems[kind] = warning
+            return data
+        except Exception as e:
+            problems[kind] = str(e)
+            return None
+
+    if "warehouses" in where:
+        data = load("warehouses") or {}
+        ticks_per_day = (data.get("meta") or {}).get("yearTicks")
+        ticks_per_day = ticks_per_day / 365.25 if ticks_per_day else None
+        for w in data.get("warehouses") or []:
+            for f in w.get("flows") or []:
+                if f.get("deliveryTimeSec") and f["cargo"] not in delivery:
+                    d = {"seconds": f["deliveryTimeSec"]}
+                    if ticks_per_day:
+                        d["gameDays"] = round(f["deliveryTimeSec"] * 1000 / ticks_per_day, 1)
+                    delivery[f["cargo"]] = d
+                add("warehouse", w, f.get("cargo"),
+                    {"pastDue": f.get("pastDue"), "count": (w.get("holding") or {}).get(f.get("cargo")),
+                     "quality": f.get("quality"), "veryBad": f.get("veryBad")},
+                    {"outPerYear": flow_in_out(f)[1]})
+    if "stations" in where:
+        data = load("stations") or {}
+        for st in data.get("stations") or []:
+            for name, q in (st.get("pastDue") or {}).items():
+                add("station", st, name, q, {"lines": [l.get("name") for l in st.get("lines") or []] or None})
+    if "industries" in where:
+        data = load("industries") or {}
+        for i in data.get("industries") or []:
+            for o in i.get("outputs") or []:
+                add("industry", i, o.get("cargo"),
+                    {"pastDue": o.get("pastDue"), "count": o.get("waiting"), "quality": o.get("quality")},
+                    {"shippedPerYear": o.get("shippedPerYear"), "producedPerYear": o.get("producedPerYear")})
+    if "lines" in where:
+        snap = load("lines") or {}
+        for l in snap.get("lines") or []:
+            q = l.get("cargoQuality") or {}
+            n = q.get("pastDue") or 0
+            if n < min_past_due or not wanted(l.get("cargos") or [], l.get("towns") or []):
+                continue
+            on_lines += n
+            rows.append(compact({"where": "line", "id": l.get("id"), "name": l.get("name"),
+                                 "towns": l.get("towns") or None, "cargo": ", ".join(l.get("cargos") or []) or None,
+                                 "pastDue": n, "count": q.get("count"), "quality": q.get("quality"),
+                                 "veryBad": q.get("veryBad")}))
+    rows.sort(key=lambda r: (-(r.get("pastDue") or 0), r.get("quality") if r.get("quality") is not None else 1))
+    limit = max(1, min(int(args.get("limit") or 50), 1000))
+    out = {"totalPastDue": sum(r["pastDue"] for r in rows), "places": len(rows), "rows": rows[:limit],
+           "byCargo": dict(sorted(by_cargo.items(), key=lambda kv: -kv[1]["pastDue"])),
+           "notes": "Cargo past its delivery time (the game's cargo quality: countBad = units no longer in time), "
+                    "wherever it is now. where: warehouse (stored), station (waiting for a line), industry (in the "
+                    "output stock, waiting for pickup; current game builds report no stored industry output), line (on the line's vehicles or stops; not split per cargo). "
+                    "count = units there now, pastDue = of those, past their delivery time, quality = average 0-1. "
+                    "byCargo excludes lines. deliveryTimes: each cargo type's delivery time as the game reports it; "
+                    "gameDays assumes the same clock as game time. Passengers are left out."}
+    if on_lines:
+        out["pastDueOnLines"] = on_lines
+    if delivery:
+        out["deliveryTimes"] = delivery
+    if problems:
+        out["warning"] = "; ".join(f"{k}: {v}" for k, v in problems.items())
+    out["dataAgeSec"] = round(oldest_age)
     return out
 
 
@@ -1285,6 +1518,34 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {
             "carrier": {"type": "string", "enum": ["ROAD", "RAIL", "TRAM", "AIR", "WATER"]}}},
         "handler": tool_list_depots,
+    },
+    {
+        "name": "tf3_list_warehouses",
+        "description": "Transport Fever 3: your warehouses with what is stored in them now against capacity, and "
+                       "how much of each cargo arrived versus left again over the last 12 months. Use it to find "
+                       "cargo sitting in a warehouse that is not being carried onward.",
+        "inputSchema": {"type": "object", "properties": {
+            "status": {"type": "string", "enum": list(WAREHOUSE_STATUS), "description": "default all"},
+            "cargo": {"type": "string", "description": "only warehouses holding or moving this cargo, e.g. PLANKS"},
+            "town": {"type": "string", "description": "closest town name contains"},
+            "name_contains": {"type": "string"},
+            "sort_by": {"type": "string", "enum": list(WAREHOUSE_SORT), "description": "default waitingTotal"},
+            "limit": {"type": "integer", "description": "default 50"}}},
+        "handler": tool_list_warehouses,
+    },
+    {
+        "name": "tf3_stale_cargo",
+        "description": "Transport Fever 3: cargo past its delivery time, wherever it is: stored in warehouses, "
+                       "waiting at stations, sitting in industries' output stocks, or on lines. Ranked by how many "
+                       "units are past due, with totals per cargo and each cargo's delivery time.",
+        "inputSchema": {"type": "object", "properties": {
+            "cargo": {"type": "string", "description": "only this cargo, e.g. IRON_ORE"},
+            "town": {"type": "string", "description": "only places in towns whose name contains this"},
+            "where": {"type": "array", "items": {"type": "string", "enum": list(STALE_WHERE)},
+                      "description": "default all"},
+            "min_past_due": {"type": "integer", "description": "default 1"},
+            "limit": {"type": "integer", "description": "default 50"}}},
+        "handler": tool_stale_cargo,
     },
     {
         "name": "tf3_finances",

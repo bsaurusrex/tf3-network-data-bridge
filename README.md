@@ -81,6 +81,8 @@ For a quick check without an AI app, run
 | `tf3_list_industries` | Industries with production, inputs, shipping and problems, plus supply and demand per cargo |
 | `tf3_list_stations` | Your stations with waiting passengers and cargo, long waits, how full they are and their lines |
 | `tf3_list_depots` | Your depots with carrier, location, vehicles inside and nearest town |
+| `tf3_list_warehouses` | Your warehouses: what is stored now per slot against capacity (mixed slots resolved per cargo), cargo past its delivery time, and how much of each cargo left again |
+| `tf3_stale_cargo` | Cargo past its delivery time, wherever it is: warehouses, stations, industries' output stocks and lines, ranked, with totals per cargo |
 | `tf3_finances` | Balance, loan, earnings, company value, the finance table and line profit per carrier |
 
 Some prompts to try:

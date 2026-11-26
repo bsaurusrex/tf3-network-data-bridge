@@ -104,6 +104,13 @@ local function industry(id, ctx)
 				maxProductionPerYear = num(try("maxProduction", function() return stock().getCargoMaxProductionPerYear(sl, c) end)),
 				shippedPerYear = num(try("shipped", function() return stock().getCargoTypeShippedPerYear(sl, c) end)),
 			}
+			local Q = collect.quality(try("getCargoQualityDataForStockList", function()
+				return api.engine.util.cargo.getCargoQualityDataForStockList(sl, c)
+			end))
+			if Q then
+				local o = outputs[#outputs]
+				o.waiting, o.pastDue, o.quality = Q.count, Q.pastDue, Q.quality
+			end
 		end
 	end
 	if #inputs > 0 then I.inputs = inputs end
@@ -152,7 +159,7 @@ local function waitingAt(group, c)
 		return api.engine.util.cargo.getCargoQualityDataAtStationGroup(group, c)
 	end)
 	if q == nil then return nil end
-	return num(get(q, "countTotal")), get(q, "isVeryBad"), num(get(q, "averageQuality"))
+	return num(get(q, "countTotal")), get(q, "isVeryBad"), num(get(q, "averageQuality")), collect.quality(q)
 end
 
 local function stationGroup(entry, ctx)
@@ -193,7 +200,7 @@ local function stationGroup(entry, ctx)
 		end
 	end
 	S.lines = lines
-	local waiting, anyWaiting, veryBad = {}, false, {}
+	local waiting, anyWaiting, veryBad, pastDue = {}, false, {}, {}
 	local stops = toArray(try("getLineStops", function() return api.engine.system.lineSystem.getLineStops(g) end))
 	for _, c in ipairs(cargos) do
 		local n = 0
@@ -203,8 +210,9 @@ local function stationGroup(entry, ctx)
 				return api.engine.system.simEntityAtTerminalSystem.getLineStopSimEntitiesCount(line, stopIndex, c)
 			end)) or 0)
 		end
-		local q, bad = waitingAt(g, c)
+		local q, bad, _, Q = waitingAt(g, c)
 		n = math.max(n, q or 0)
+		if Q and Q.pastDue > 0 then pastDue[cargoName(c)] = Q end
 		if n > 0 then
 			waiting[cargoName(c)], anyWaiting = n, true
 			if bad then veryBad[#veryBad + 1] = cargoName(c) end
@@ -212,6 +220,7 @@ local function stationGroup(entry, ctx)
 	end
 	if anyWaiting then S.waiting = waiting end
 	if #veryBad > 0 then S.longWaits = veryBad end
+	if next(pastDue) ~= nil then S.pastDue = pastDue end
 	return S
 end
 
@@ -370,6 +379,208 @@ M.jobs.vehicles = {
 			end
 		end
 		return { { key = "vehicles", items = items, fn = liveVehicle } }
+	end,
+}
+
+---------------------------------------------------------------------------------------------------------------------
+-- warehouses: what is stored now against capacity, and the delivered and shipped rates per cargo. Cargo that keeps
+-- arriving but does not leave is cargo stuck in the warehouse, which no other kind shows.
+
+local STOCK_TYPES = { "InputStock", "OutputStock", "StorageStock" }
+
+local function stockTypeName(v) return collect.enumName("StockListType", STOCK_TYPES, v) end
+
+-- how much of each cargo the given stock slots hold, asking the stock system through `holder`
+local function countPerCargo(holder, stockIds, cargoIds)
+	local held, sum = {}, 0
+	for k = 1, size(stockIds) do
+		local sid = at(stockIds, k)
+		for j = 1, size(cargoIds) do
+			local c = at(cargoIds, j)
+			local n = num(try("getStockCountForCargoType", function()
+				return api.engine.system.simEntityAtStockSystem.getStockCountForCargoType(holder, sid, c)
+			end)) or 0
+			if n > 0 then held[c], sum = (held[c] or 0) + n, sum + n end
+		end
+	end
+	return held, sum
+end
+
+-- what a slot group holds per cargo. A group for one cargo holds only that; a group that takes several cargo types
+-- is asked per cargo. The API does not say which entity holds the stock (the warehouse, its stock list or its
+-- construction), so each is tried and the one whose counts add up to the group's total is kept for the request.
+local function heldInGroup(ctx, holders, stockIds, cargoIds, count)
+	if size(cargoIds) == 1 then return { [at(cargoIds, 1)] = count } end
+	if count <= 0 then return {} end
+	if ctx.holderIndex then
+		local held = countPerCargo(holders[ctx.holderIndex], stockIds, cargoIds)
+		return held
+	end
+	for i, h in ipairs(holders) do
+		local held, sum = countPerCargo(h, stockIds, cargoIds)
+		if sum == count then
+			ctx.holderIndex = i
+			return held
+		end
+	end
+	return nil -- contents of this mixed slot could not be resolved
+end
+
+local function warehouse(id, ctx)
+	local W = { id = id, name = nameOf(id) }
+	local wh = comp(id, CT.WAREHOUSE)
+	if wh == nil then return W end
+	local con = get(wh, "construction")
+	W.type = shortRes(get(comp(con, CT.CONSTRUCTION), "fileName"))
+	W.position = positionOf(con, id)
+	local town = try("getConstructionClosestTown", function()
+		return api.engine.system.streetConnectorSystem.getConstructionClosestTown(con)
+	end)
+	if town ~= nil then W.town, W.townId = nameOf(town), town end
+	local sl = get(wh, "stockList")
+	if sl == nil then return W end
+	W.stockListId = sl
+	local list = comp(sl, CT.STOCK_LIST)
+	-- cargo the warehouse had to throw away: it was full and kept being delivered to
+	local thrown = ctx.thrownAway[sl] or num(get(list, "thrownAwayCargo"))
+	if thrown and thrown > 0 then W.thrownAwayCargo = thrown end
+	local slotCapacity, stocks = {}, get(list, "stocks")
+	for i = 1, size(stocks) do slotCapacity[i - 1] = num(get(at(stocks, i), "capacity")) or 0 end
+	-- one group per stock type and cargo set, with how much is held right now (empty groups included, so the
+	-- configured capacity shows even when nothing is in it)
+	local holders = { id, sl, con }
+	local groups, waiting, accepted, acceptedOrder, holding = {}, 0, {}, {}, {}
+	for _, g in ipairs(toArray(try("getStockGroupsByTypeAndCargoTypes", function()
+		return stock().getStockGroupsByTypeAndCargoTypes(sl, true, true, false)
+	end))) do
+		local ids, cargoIds, count = at(g, 2), at(g, 3), num(at(g, 4)) or 0
+		local capacity = 0
+		for k = 1, size(ids) do capacity = capacity + (slotCapacity[at(ids, k)] or 0) end
+		for k = 1, size(cargoIds) do
+			local c = at(cargoIds, k)
+			if c ~= nil and not accepted[c] then accepted[c], acceptedOrder[#acceptedOrder + 1] = true, c end
+		end
+		local G = { stockType = stockTypeName(at(g, 1)), waiting = count, capacity = capacity, slots = size(ids) }
+		local held = heldInGroup(ctx, holders, ids, cargoIds, count)
+		if size(cargoIds) > 1 then G.mixed, G.accepts = true, size(cargoIds) end
+		if held == nil then
+			G.contentsUnknown = true
+		else
+			local names, per = {}, {}
+			for c, n in pairs(held) do
+				local cn = cargoName(c)
+				if cn then
+					names[#names + 1], per[cn] = cn, n
+					if n > 0 then holding[cn] = (holding[cn] or 0) + n end
+				end
+			end
+			table.sort(names)
+			G.cargos = names
+			if G.mixed and #names > 0 then G.held = per end
+		end
+		if not G.mixed and G.cargos == nil then G.cargos = { cargoName(at(cargoIds, 1)) } end
+		groups[#groups + 1] = G
+		waiting = waiting + count
+	end
+	if #groups > 0 then W.stocks = groups end
+	W.waitingTotal = waiting
+	if next(holding) ~= nil then W.holding = holding end
+	-- logbook names on the stock list (as for lines), to read per-cargo log values below
+	local logNames = {}
+	eachPair(get(comp(sl, CT.LOG_BOOK), "name2log"), function(k) logNames[#logNames + 1] = tostring(k) end)
+	table.sort(logNames)
+	if #logNames > 0 then W.logNames = logNames end
+	-- per cargo over the last 12 months, only for cargo that is held now or moved
+	local flows = {}
+	for _, c in ipairs(acceptedOrder) do
+		local cn = cargoName(c)
+		local F = {
+			cargo = cn,
+			deliveredPerYear = num(try("delivered", function() return stock().getCargoTypeDeliveredPerYear(sl, c) end)),
+			shippedPerYear = num(try("shipped", function() return stock().getCargoTypeShippedPerYear(sl, c) end)),
+		}
+		local logs = {}
+		for _, name in ipairs(logNames) do
+			local v = num(try("getCargoLogValueDiffPerYear", function()
+				return stock().getCargoLogValueDiffPerYear(sl, name, c)
+			end))
+			if v and v ~= 0 then logs[name] = v end
+		end
+		if next(logs) ~= nil then F.logsPerYear = logs end
+		local Q = collect.quality(try("getCargoQualityDataForStockList", function()
+			return api.engine.util.cargo.getCargoQualityDataForStockList(sl, c)
+		end))
+		if Q then F.pastDue, F.quality, F.veryBad = Q.pastDue, Q.quality, Q.veryBad end
+		if (holding[cn] or 0) > 0 or (F.deliveredPerYear or 0) > 0 or (F.shippedPerYear or 0) > 0 or F.logsPerYear then
+			if ctx.deliveryTime[c] == nil then
+				ctx.deliveryTime[c] = num(try("getAdjustedDeliveryTime", function()
+					return stock().getAdjustedDeliveryTime(c)
+				end)) or false
+			end
+			F.deliveryTimeSec = ctx.deliveryTime[c] or nil
+			flows[#flows + 1] = F
+		end
+	end
+	if #flows > 0 then W.flows = flows end
+	W.deliveredPerYear = num(try("deliveredTotal", function() return stock().getCargoDeliveredPerYear(sl) end))
+	W.shippedPerYear = num(try("shippedTotal", function() return stock().getCargoShippedPerYear(sl) end))
+	local sq = try("getSummarizedCargoQualityDataForStockList", function()
+		return api.engine.util.cargo.getSummarizedCargoQualityDataForStockList(sl)
+	end)
+	local Q = sq ~= nil and collect.quality(get(sq, "cargo")) or nil
+	if Q then W.pastDue, W.quality = Q.pastDue, Q.quality end
+	return W
+end
+
+-- the player's warehouses. Unlike a station, a warehouse entity need not carry PLAYER_OWNED itself (its construction
+-- may), so the owner filter of getEntitiesWithComponent would drop them all: the owner is looked up on the warehouse,
+-- then on its construction, and a warehouse with no owner recorded on either is kept.
+local function ownerOf(e)
+	if e == nil then return nil end
+	return get(comp(e, CT.PLAYER_OWNED), "player")
+end
+
+local function playerWarehouses(player)
+	local all = toArray(try("getEntitiesWithComponent", function()
+		return api.engine.getEntitiesWithComponent(CT.WAREHOUSE)
+	end))
+	local out = {}
+	for _, e in ipairs(all) do
+		local owner = ownerOf(e)
+		if owner == nil then owner = ownerOf(get(comp(e, CT.WAREHOUSE), "construction")) end
+		if owner == nil or owner == player then out[#out + 1] = e end
+	end
+	if #out == 0 then
+		-- none found: say why in the diagnostics (warehouse entities at all, and warehouse constructions)
+		local names, cons = {}, 0
+		for _, con in ipairs(toArray(try("constructions", function()
+			return api.engine.getEntitiesWithComponent(CT.CONSTRUCTION)
+		end))) do
+			local f = get(comp(con, CT.CONSTRUCTION), "fileName")
+			local lf = type(f) == "string" and f:lower() or ""
+			if lf:find("warehouse") or lf:find("storage") then
+				cons = cons + 1
+				if #names < 3 then names[#names + 1] = f end
+			end
+		end
+		collect.note("warehouses", string.format("%d entities with a WAREHOUSE component, %d kept as yours; "
+			.. "%d warehouse constructions (%s)", #all, #out, cons, table.concat(names, ", ")))
+	end
+	return out
+end
+
+M.jobs.warehouses = {
+	start = function(ctx)
+		ctx.thrownAway, ctx.deliveryTime = {}, {}
+		eachPair(try("getStockListsWithThrownAwayCargo", function()
+			return stock().getStockListsWithThrownAwayCargo()
+		end), function(e, amount)
+			local n = num(amount)
+			if n and n > 0 then ctx.thrownAway[e] = n end
+		end)
+		local list = playerWarehouses(ctx.player)
+		table.sort(list)
+		return { { key = "warehouses", items = list, fn = warehouse } }
 	end,
 }
 
